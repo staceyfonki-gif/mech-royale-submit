@@ -1,4 +1,4 @@
-"""Squad-aware survival bot for mechfight."""
+"""Evasive survival bot for mechfight."""
 import math
 import mechfight as mf
 
@@ -15,20 +15,20 @@ def _score_choice(choice: dict) -> float:
     text = f"{choice.get('id', '')} {choice.get('name', '')} {choice.get('desc', '')}".lower()
     score = 0.0
     for kw, pts in (
-        ("hp", 6.0),
-        ("health", 6.0),
-        ("shield", 5.5),
-        ("armor", 5.0),
-        ("regen", 5.0),
-        ("repair", 5.0),
-        ("speed", 4.5),
-        ("move", 4.0),
-        ("boost", 4.0),
-        ("energy", 4.0),
-        ("cooldown", 3.0),
-        ("reload", 2.5),
-        ("damage", 2.0),
-        ("range", 1.5),
+        ("hp", 7.0),
+        ("health", 7.0),
+        ("shield", 6.5),
+        ("armor", 6.0),
+        ("regen", 6.0),
+        ("repair", 6.0),
+        ("speed", 5.0),
+        ("move", 4.5),
+        ("boost", 4.5),
+        ("energy", 4.5),
+        ("cooldown", 2.5),
+        ("reload", 2.0),
+        ("damage", 1.5),
+        ("range", 1.0),
     ):
         if kw in text:
             score += pts
@@ -47,8 +47,32 @@ def _can_fire_slot(weapons: list, idx: int) -> bool:
     return True
 
 
+def _dodge_projectile_yaw(x: float, y: float, projectiles: list, strafe_dir: float):
+    """Return an evade yaw if a projectile is moving close to (x, y), else None."""
+    best_threat = None
+    best_dist = 22.0
+    for p in projectiles:
+        ppos = p.get("pos", [0.0, 0.0, 0.0])
+        pvel = p.get("vel", [0.0, 0.0, 0.0])
+        px, py = float(ppos[0]), float(ppos[1])
+        vx, vy = float(pvel[0]), float(pvel[1])
+        dx, dy = x - px, y - py
+        dist = math.hypot(dx, dy)
+        if dist < best_dist and dist > 1e-6:
+            speed = math.hypot(vx, vy)
+            if speed > 1.0:
+                # Check if projectile is moving generally toward our position
+                dot = (dx * vx + dy * vy) / (dist * speed)
+                if dot > 0.55:
+                    best_dist = dist
+                    best_threat = math.atan2(vy, vx)
+    if best_threat is not None:
+        return best_threat + strafe_dir * (math.pi * 0.5)
+    return None
+
+
 class Bot:
-    name = "kestrel-v3"
+    name = "kestrel-v4"
 
     def __init__(self, hello: mf.Hello):
         cfg = hello.get("config", {})
@@ -105,54 +129,59 @@ class Bot:
                 chosen = non_gun[0] if non_gun else near[0]
                 act["take"] = chosen["id"]
 
-        # Flip lateral strafe direction periodically or when hit
         tick_int = int(obs["tick"])
-        if took_hit or tick_int % 65 == 0:
+        if took_hit or tick_int % 55 == 0:
             self.strafe_dir *= -1.0
 
         enemies = [m for m in obs.get("mechs", []) if m.get("kind") == "mech"]
         enemies.sort(key=lambda m: math.dist(m["pos"], me["pos"]))
         nearest_dist = math.hypot(enemies[0]["pos"][0] - x, enemies[0]["pos"][1] - y) if enemies else 999.0
 
-        # 3. Movement: survival & zone safety first (avoid becoming an easy squad target)
         to_zone_yaw = math.atan2(next_cy - y, next_cx - x)
-        urgent_zone = (not in_zone) or (shrinking and dist_next > next_r * 0.62) or (dist_next > next_r * 0.82)
+        urgent_zone = (not in_zone) or (shrinking and dist_next > next_r * 0.68) or (dist_next > next_r * 0.84)
 
         def _inside_safe_next(yaw: float, step: float = 10.0) -> bool:
             nx = x + math.cos(yaw) * step
             ny = y + math.sin(yaw) * step
-            return math.hypot(next_cx - nx, next_cy - ny) < next_r * 0.86
+            return math.hypot(next_cx - nx, next_cy - ny) < next_r * 0.84
 
+        dodge_yaw = _dodge_projectile_yaw(x, y, obs.get("projectiles", []), self.strafe_dir)
+
+        # 3. Movement: prioritize zone safety, incoming fire dodge, and staying off center aggro
         if urgent_zone:
             move_yaw = to_zone_yaw
-            want_boost = (not in_zone or zone_dps >= 4.0) and energy > 22.0
-        elif hp_ratio < 0.55 and enemies and nearest_dist < 32.0:
+            want_boost = (not in_zone or zone_dps >= 3.0) and energy > 20.0
+        elif dodge_yaw is not None and _inside_safe_next(dodge_yaw, 8.0):
+            move_yaw = dodge_yaw
+            want_boost = energy > 25.0
+        elif hp_ratio < 0.65 and enemies and nearest_dist < 38.0:
             away_yaw = math.atan2(y - enemies[0]["pos"][1], x - enemies[0]["pos"][0])
-            evade_yaw = away_yaw + self.strafe_dir * 0.45
+            evade_yaw = away_yaw + self.strafe_dir * 0.5
             if _inside_safe_next(evade_yaw):
                 move_yaw = evade_yaw
             elif _inside_safe_next(away_yaw):
                 move_yaw = away_yaw
             else:
                 move_yaw = to_zone_yaw
-            want_boost = energy > 28.0
+            want_boost = energy > 24.0
         elif took_hit and hit_bearings:
             perp_yaw = hit_bearings[0] + self.strafe_dir * (math.pi * 0.5)
             move_yaw = perp_yaw if _inside_safe_next(perp_yaw) else to_zone_yaw
-            want_boost = hp_ratio < 0.65 and energy > 30.0
-        elif dist_next > next_r * 0.35:
+            want_boost = energy > 25.0
+        elif dist_next > next_r * 0.65:
             move_yaw = to_zone_yaw
             want_boost = False
         else:
-            strafe_yaw = to_zone_yaw + self.strafe_dir * (math.pi * 0.48)
-            move_yaw = strafe_yaw if _inside_safe_next(strafe_yaw, 8.0) else to_zone_yaw
+            # Orbit/weave gently without rushing straight into the middle
+            weave_yaw = to_zone_yaw + self.strafe_dir * (math.pi * 0.55)
+            move_yaw = weave_yaw if _inside_safe_next(weave_yaw, 8.0) else to_zone_yaw
             want_boost = False
 
         act["move"] = [math.cos(move_yaw), math.sin(move_yaw)]
         act["boost"] = want_boost
-        act["jump"] = (tick_int % 30 == 0 and energy > 18.0) or (took_hit and energy > 24.0)
+        act["jump"] = (tick_int % 28 == 0 and energy > 18.0) or (dodge_yaw is not None and energy > 20.0)
 
-        # 4. Aiming & selective firing (save energy/attention when hurting)
+        # 4. Aiming & selective firing (avoid drawing attention when hurt)
         cur_yaw = float(me.get("aim", [0.0, 0.0])[0])
         act["aim"] = [to_zone_yaw, 0.0]
 
@@ -168,8 +197,8 @@ class Bot:
             act["aim"] = [aim_yaw, aim_pitch]
 
             yaw_err = abs(_wrap_angle(aim_yaw - cur_yaw))
-            safe_to_engage = (hp_ratio >= 0.32) or (horiz_dist < 16.0)
-            if safe_to_engage and horiz_dist < 72.0 and yaw_err < 0.28:
+            safe_to_engage = (hp_ratio >= 0.45) or (horiz_dist < 14.0)
+            if safe_to_engage and horiz_dist < 68.0 and yaw_err < 0.28:
                 f0 = _can_fire_slot(weapons, 0)
                 f1 = _can_fire_slot(weapons, 1)
                 if f0 or f1:
