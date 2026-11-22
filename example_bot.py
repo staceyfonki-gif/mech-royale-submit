@@ -1,4 +1,4 @@
-"""Survival-focused bot for mechfight."""
+"""Squad-aware survival bot for mechfight."""
 import math
 import mechfight as mf
 
@@ -15,17 +15,20 @@ def _score_choice(choice: dict) -> float:
     text = f"{choice.get('id', '')} {choice.get('name', '')} {choice.get('desc', '')}".lower()
     score = 0.0
     for kw, pts in (
-        ("hp", 5.0),
-        ("health", 5.0),
-        ("armor", 4.5),
-        ("speed", 4.0),
-        ("move", 3.5),
-        ("boost", 3.5),
-        ("energy", 3.5),
+        ("hp", 6.0),
+        ("health", 6.0),
+        ("shield", 5.5),
+        ("armor", 5.0),
+        ("regen", 5.0),
+        ("repair", 5.0),
+        ("speed", 4.5),
+        ("move", 4.0),
+        ("boost", 4.0),
+        ("energy", 4.0),
         ("cooldown", 3.0),
         ("reload", 2.5),
-        ("damage", 2.5),
-        ("range", 2.0),
+        ("damage", 2.0),
+        ("range", 1.5),
     ):
         if kw in text:
             score += pts
@@ -45,17 +48,20 @@ def _can_fire_slot(weapons: list, idx: int) -> bool:
 
 
 class Bot:
-    name = "kestrel-v2"
+    name = "kestrel-v3"
 
     def __init__(self, hello: mf.Hello):
         cfg = hello.get("config", {})
         self.reach = cfg.get("loot", {}).get("pickup_radius", 4.0)
+        self.strafe_dir = 1.0 if int(hello.get("seed", 0)) % 2 == 0 else -1.0
 
     def act(self, obs: mf.Observation) -> mf.Action:
         me = obs["self"]
         x, y, z = me["pos"]
-        hp_ratio = me["hp"] / max(1.0, me.get("max_hp", 100.0))
-        energy = me.get("energy", 0.0)
+        hp = float(me.get("hp", 100.0))
+        max_hp = max(1.0, float(me.get("max_hp", 100.0)))
+        hp_ratio = hp / max_hp
+        energy = float(me.get("energy", 0.0))
         in_zone = bool(me.get("in_zone", True))
 
         zone = obs["zone"]
@@ -63,11 +69,22 @@ class Bot:
         next_r = max(1.0, float(zone.get("next_radius", 50.0)))
         dist_next = math.hypot(next_cx - x, next_cy - y)
         t = float(obs.get("t", 0.0))
-        shrinking = float(zone.get("shrink_start", 0.0)) <= t <= float(zone.get("shrink_end", 0.0))
+        shrink_start = float(zone.get("shrink_start", 0.0))
+        shrink_end = float(zone.get("shrink_end", 0.0))
+        zone_dps = float(zone.get("dps", 0.0))
+        shrinking = shrink_start <= t <= shrink_end
+
+        events = obs.get("events", [])
+        took_hit = any(e.get("type") == "damaged" for e in events)
+        hit_bearings = [
+            float(e["bearing"])
+            for e in events
+            if e.get("type") == "damaged" and e.get("bearing") is not None
+        ]
 
         act: mf.Action = {"tick": obs["tick"]}
 
-        # 1. Pick strongest survival/mobility upgrade if offered
+        # 1. Pick strongest survival / mobility / energy upgrade
         offer = obs.get("offer")
         if offer and offer.get("choices"):
             best_idx = max(
@@ -76,7 +93,7 @@ class Bot:
             )
             act["pick"] = best_idx
 
-        # 2. Grab a weapon into empty slot 1 when in pickup range
+        # 2. Grab a weapon into empty slot 1 when within pickup radius
         weapons = me.get("weapons", [])
         if len(weapons) > 1 and weapons[1] is None:
             near = [
@@ -88,39 +105,55 @@ class Bot:
                 chosen = non_gun[0] if non_gun else near[0]
                 act["take"] = chosen["id"]
 
-        # 3. Movement: get inside next zone early/cleanly, kite low-HP close fights
-        to_zone_yaw = math.atan2(next_cy - y, next_cx - x)
-        must_push_zone = (not in_zone) or (shrinking and dist_next > next_r * 0.65) or (dist_next > next_r * 0.85)
+        # Flip lateral strafe direction periodically or when hit
+        tick_int = int(obs["tick"])
+        if took_hit or tick_int % 65 == 0:
+            self.strafe_dir *= -1.0
 
         enemies = [m for m in obs.get("mechs", []) if m.get("kind") == "mech"]
         enemies.sort(key=lambda m: math.dist(m["pos"], me["pos"]))
+        nearest_dist = math.hypot(enemies[0]["pos"][0] - x, enemies[0]["pos"][1] - y) if enemies else 999.0
 
-        if must_push_zone:
+        # 3. Movement: survival & zone safety first (avoid becoming an easy squad target)
+        to_zone_yaw = math.atan2(next_cy - y, next_cx - x)
+        urgent_zone = (not in_zone) or (shrinking and dist_next > next_r * 0.62) or (dist_next > next_r * 0.82)
+
+        def _inside_safe_next(yaw: float, step: float = 10.0) -> bool:
+            nx = x + math.cos(yaw) * step
+            ny = y + math.sin(yaw) * step
+            return math.hypot(next_cx - nx, next_cy - ny) < next_r * 0.86
+
+        if urgent_zone:
             move_yaw = to_zone_yaw
-            want_boost = (not in_zone) and energy > 24.0
-        elif enemies and hp_ratio < 0.48 and math.dist(enemies[0]["pos"][:2], (x, y)) < 24.0:
+            want_boost = (not in_zone or zone_dps >= 4.0) and energy > 22.0
+        elif hp_ratio < 0.55 and enemies and nearest_dist < 32.0:
             away_yaw = math.atan2(y - enemies[0]["pos"][1], x - enemies[0]["pos"][0])
-            cand_x = x + math.cos(away_yaw) * 10.0
-            cand_y = y + math.sin(away_yaw) * 10.0
-            if math.hypot(next_cx - cand_x, next_cy - cand_y) < next_r * 0.88:
+            evade_yaw = away_yaw + self.strafe_dir * 0.45
+            if _inside_safe_next(evade_yaw):
+                move_yaw = evade_yaw
+            elif _inside_safe_next(away_yaw):
                 move_yaw = away_yaw
             else:
                 move_yaw = to_zone_yaw
-            want_boost = energy > 35.0
+            want_boost = energy > 28.0
+        elif took_hit and hit_bearings:
+            perp_yaw = hit_bearings[0] + self.strafe_dir * (math.pi * 0.5)
+            move_yaw = perp_yaw if _inside_safe_next(perp_yaw) else to_zone_yaw
+            want_boost = hp_ratio < 0.65 and energy > 30.0
         elif dist_next > next_r * 0.35:
             move_yaw = to_zone_yaw
             want_boost = False
         else:
-            strafe_dir = 1.0 if int(obs["tick"]) % 80 < 40 else -1.0
-            move_yaw = to_zone_yaw + strafe_dir * (math.pi * 0.45)
+            strafe_yaw = to_zone_yaw + self.strafe_dir * (math.pi * 0.48)
+            move_yaw = strafe_yaw if _inside_safe_next(strafe_yaw, 8.0) else to_zone_yaw
             want_boost = False
 
         act["move"] = [math.cos(move_yaw), math.sin(move_yaw)]
         act["boost"] = want_boost
-        act["jump"] = int(obs["tick"]) % 35 == 0 and energy > 18.0
+        act["jump"] = (tick_int % 30 == 0 and energy > 18.0) or (took_hit and energy > 24.0)
 
-        # 4. Aiming & firing only when in range, aligned, and ready to shoot
-        cur_yaw = me.get("aim", [0.0, 0.0])[0]
+        # 4. Aiming & selective firing (save energy/attention when hurting)
+        cur_yaw = float(me.get("aim", [0.0, 0.0])[0])
         act["aim"] = [to_zone_yaw, 0.0]
 
         if enemies:
@@ -135,14 +168,15 @@ class Bot:
             act["aim"] = [aim_yaw, aim_pitch]
 
             yaw_err = abs(_wrap_angle(aim_yaw - cur_yaw))
-            if horiz_dist < 82.0 and yaw_err < 0.30:
+            safe_to_engage = (hp_ratio >= 0.32) or (horiz_dist < 16.0)
+            if safe_to_engage and horiz_dist < 72.0 and yaw_err < 0.28:
                 f0 = _can_fire_slot(weapons, 0)
                 f1 = _can_fire_slot(weapons, 1)
                 if f0 or f1:
                     act["fire"] = [f0, f1]
                     mf.draw.line([x, y, z + 6.0], [px, py, tz + 3.5], "#ff6040")
 
-        mf.draw.label(f"hp {me['hp']:.0f} | zone {'IN' if in_zone else 'OUT'}")
+        mf.draw.label(f"hp {hp:.0f} | zone {'IN' if in_zone else 'OUT'}")
         return act
 
 
