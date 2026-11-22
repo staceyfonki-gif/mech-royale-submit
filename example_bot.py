@@ -1,4 +1,4 @@
-"""Balanced zone, cube, and survival bot for mechfight."""
+"""Targeted survival test bot (kestrel-v6) for mechfight."""
 import math
 import mechfight as mf
 
@@ -89,12 +89,11 @@ def _can_fire_slot(weapons: list, idx: int) -> bool:
 
 
 class Bot:
-    name = "kestrel-v5"
+    name = "kestrel-v6"
 
     def __init__(self, hello: mf.Hello):
         cfg = hello.get("config", {})
         self.pickup_reach = float(cfg.get("loot", {}).get("pickup_radius", 4.0))
-        self.cube_reach = float(cfg.get("cubes", {}).get("pickup_radius", 3.5))
         seed_val = int(hello.get("seed", 0))
         self.strafe_dir = 1.0 if seed_val % 2 == 0 else -1.0
         self.evade_until_tick = -1
@@ -139,7 +138,7 @@ class Bot:
             )
             act["pick"] = best_idx
 
-        # 2. Weapon pickup into empty slot 1 (avoiding duplicate weapon kinds)
+        # 2. Weapon pickup into empty slot 1 (only when within pickup radius)
         weapons = me.get("weapons", [])
         held_kinds = {w.get("kind") for w in weapons if isinstance(w, dict)}
         if len(weapons) > 1 and weapons[1] is None:
@@ -159,8 +158,8 @@ class Bot:
             if w0.get("ammo") is not None and float(w0.get("ammo", 0)) <= 0.0 and float(w0.get("reload", 0.0)) <= 0.0:
                 act["reload"] = True
 
-        # 3. Committed evasion state (prevents rapid back-and-forth jitter on multi-hit ticks)
-        if tick % 70 == 0:
+        # 3. Longer committed evasion (14 ticks = 0.7s)
+        if tick % 64 == 0:
             self.strafe_dir *= -1.0
 
         to_cur_yaw = math.atan2(cur_cy - y, cur_cx - x)
@@ -182,7 +181,7 @@ class Bot:
         if took_hit and hit_bearings:
             cand = hit_bearings[0] + self.strafe_dir * (math.pi * 0.52)
             self.evade_yaw = cand if _safe_step(cand) else (to_next_yaw if urgent_zone else to_cur_yaw)
-            self.evade_until_tick = tick + 8
+            self.evade_until_tick = tick + 14
             self.strafe_dir *= -1.0
 
         dodge_yaw = _dodge_projectile_yaw(x, y, obs.get("projectiles", []), self.strafe_dir)
@@ -197,37 +196,22 @@ class Bot:
             else 999.0
         )
 
-        # Look for nearby power cubes when safe and healthy enough
-        cubes = obs.get("cubes", [])
-        best_cube = None
-        best_cube_dist = 32.0
-        for c in cubes:
-            cd = math.hypot(float(c["pos"][0]) - x, float(c["pos"][1]) - y)
-            if cd < best_cube_dist:
-                cyaw = math.atan2(float(c["pos"][1]) - y, float(c["pos"][0]) - x)
-                if _safe_step(cyaw, min(cd + 2.0, 12.0)):
-                    best_cube_dist = cd
-                    best_cube = c
-
-        # 4. Movement decision
+        # 4. Movement decision (no long-range detours for cubes)
         want_boost = False
         if urgent_zone:
             move_yaw = to_next_yaw if (time_to_shrink_end < 18.0 or dist_next < dist_cur) else to_cur_yaw
             want_boost = ((not in_zone) or zone_dps >= 35.0) and energy > 22.0
         elif tick <= self.evade_until_tick:
             move_yaw = self.evade_yaw
-            want_boost = hp_ratio < 0.7 and energy > 24.0
+            want_boost = hp_ratio < 0.75 and energy > 22.0
         elif dodge_yaw is not None and _safe_step(dodge_yaw, 8.0):
             move_yaw = dodge_yaw
-            want_boost = energy > 25.0
-        elif hp_ratio < 0.55 and nearest_enemy is not None and nearest_dist < 42.0:
+            want_boost = energy > 24.0
+        elif hp_ratio < 0.60 and nearest_enemy is not None and nearest_dist < 45.0:
             away_yaw = math.atan2(y - float(nearest_enemy["pos"][1]), x - float(nearest_enemy["pos"][0]))
             evade_yaw = away_yaw + self.strafe_dir * 0.45
             move_yaw = evade_yaw if _safe_step(evade_yaw) else (away_yaw if _safe_step(away_yaw) else to_next_yaw)
             want_boost = energy > 22.0
-        elif best_cube is not None and hp_ratio >= 0.45:
-            move_yaw = math.atan2(float(best_cube["pos"][1]) - y, float(best_cube["pos"][0]) - x)
-            want_boost = False
         elif dist_next > next_r * 0.68:
             move_yaw = to_next_yaw
             want_boost = False
@@ -238,29 +222,22 @@ class Bot:
 
         act["move"] = [math.cos(move_yaw), math.sin(move_yaw)]
         act["boost"] = want_boost
-        act["jump"] = (tick % 32 == 0 and energy > 20.0) or (dodge_yaw is not None and energy > 22.0)
+        act["jump"] = (tick % 30 == 0 and energy > 20.0) or (dodge_yaw is not None and energy > 22.0)
 
-        # 5. Aim & combat
+        # 5. Aim & selective close-range combat
         cur_yaw = float(me.get("aim", [0.0, 0.0])[0])
-        target = nearest_enemy
-        if target is None and hp_ratio >= 0.65 and not urgent_zone:
-            npcs = [m for m in all_mechs if m.get("kind") == "npc"]
-            npcs.sort(key=lambda m: math.hypot(float(m["pos"][0]) - x, float(m["pos"][1]) - y))
-            if npcs and math.hypot(float(npcs[0]["pos"][0]) - x, float(npcs[0]["pos"][1]) - y) < 35.0:
-                target = npcs[0]
-
-        if target is not None:
-            tx, ty, tz = [float(v) for v in target["pos"]]
-            tvx, tvy, _ = [float(v) for v in target.get("vel", [0.0, 0.0, 0.0])]
+        if nearest_enemy is not None:
+            tx, ty, tz = [float(v) for v in nearest_enemy["pos"]]
+            tvx, tvy, _ = [float(v) for v in nearest_enemy.get("vel", [0.0, 0.0, 0.0])]
             horiz_dist = math.hypot(tx - x, ty - y)
-            lead_t = min(0.55, horiz_dist / 120.0)
+            lead_t = min(0.5, horiz_dist / 120.0)
             px, py = tx + tvx * lead_t, ty + tvy * lead_t
             aim_yaw = math.atan2(py - y, px - x)
             aim_pitch = math.atan2(tz - z - 1.5, max(1.0, math.hypot(px - x, py - y)))
             act["aim"] = [aim_yaw, aim_pitch]
 
             yaw_err = abs(_wrap_angle(aim_yaw - cur_yaw))
-            can_trade = (hp_ratio >= 0.50 and horiz_dist < 85.0) or (horiz_dist < 18.0 and hp_ratio >= 0.25)
+            can_trade = (hp_ratio >= 0.60 and horiz_dist < 45.0) or (horiz_dist < 16.0 and hp_ratio >= 0.30)
             if can_trade and yaw_err < 0.24:
                 f0 = _can_fire_slot(weapons, 0)
                 f1 = _can_fire_slot(weapons, 1)
